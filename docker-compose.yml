@@ -1,0 +1,10 @@
+services:
+  recommender-app:
+    build: .
+    image: recommender-app
+    ports:
+      - "8501:8501"
+    environment:
+      RECOMMENDER_DATA: ${RECOMMENDER_DATA:-}
+    volumes:
+      - ./data:/app/data:ro

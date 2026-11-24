@@ -1,119 +1,129 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from surprise import Dataset, Reader, SVD
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import urllib.request
-import gzip
-import shutil
 import os
+from pathlib import Path
 
-# --- 1. ЗАГРУЗКА ДАННЫХ (Кэшируем, чтобы не скачивать каждый раз) ---
-@st.cache_data
-def load_data():
-    url = "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Toys_and_Games_5.json.gz"
-    gz_filename = "reviews_Toys_and_Games_5.json.gz"
-    json_filename = "reviews_Toys_and_Games_5.json"
-    
-    if not os.path.exists(json_filename):
-        urllib.request.urlretrieve(url, gz_filename)
-        with gzip.open(gz_filename, 'rb') as f_in:
-            with open(json_filename, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-                
-    df = pd.read_json(json_filename, lines=True)
-    df_clean = df.drop_duplicates(subset=['reviewerID', 'asin'])
-    df_clean = df_clean[['reviewerID', 'asin', 'overall', 'reviewText', 'summary']]
-    return df_clean
+import numpy as np
+import pandas as pd
+import streamlit as st
+from sklearn.feature_extraction.text import TfidfVectorizer
+from surprise import SVD, Dataset, Reader
 
-@st.cache_resource
-def train_models(df_clean):
-    # Обучение SVD
-    reader = Reader(rating_scale=(1, 5))
-    data = Dataset.load_from_df(df_clean[['reviewerID', 'asin', 'overall']], reader)
-    trainset = data.build_full_trainset()
+DATA_DIR = Path(__file__).resolve().parent / "data"
+VIDEO_GAMES_FILES = (
+    "Video_Games_5.jsonl.gz",
+    "Video_Games_5.jsonl",
+    "Video_Games_5.json.gz",
+    "Video_Games_5.json",
+)
+LEGACY_FILES = ("reviews_Toys_and_Games_5.json.gz", "reviews_Toys_and_Games_5.json")
+MODERN_COLUMNS = {
+    "user_id": "reviewerID",
+    "parent_asin": "asin",
+    "rating": "overall",
+    "text": "reviewText",
+    "title": "summary",
+}
+
+
+def data_path():
+    configured = os.environ.get("RECOMMENDER_DATA")
+    if configured:
+        return Path(configured)
+    candidates = [DATA_DIR / name for name in (*VIDEO_GAMES_FILES, *LEGACY_FILES)]
+    candidates.extend(DATA_DIR.parent / name for name in LEGACY_FILES)
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+@st.cache_data(show_spinner=False)
+def load_data(path, modified_ns):
+    # Время изменения входит в ключ кэша при замене файла.
+    df = pd.read_json(path, lines=True, dtype=False)
+    if set(MODERN_COLUMNS) <= set(df):
+        df = df.rename(columns=MODERN_COLUMNS)
+    required = ["reviewerID", "asin", "overall", "reviewText", "summary"]
+    if not set(required) <= set(df):
+        raise ValueError("Ожидаются поля отзывов Amazon Reviews 2023 или Amazon 5-core.")
+    df = df[required].copy()
+    df["overall"] = pd.to_numeric(df["overall"], errors="coerce")
+    df = df.dropna(subset=["reviewerID", "asin"])
+    df = df[df["overall"].between(1, 5)]
+    df = df.drop_duplicates(subset=["reviewerID", "asin"])
+    if df.empty:
+        raise ValueError("В файле нет подходящих отзывов с оценками от 1 до 5.")
+    df[["reviewText", "summary"]] = df[["reviewText", "summary"]].fillna("").astype(str)
+    return df
+
+
+@st.cache_resource(show_spinner=False)
+def train_models(path, modified_ns):
+    df = load_data(path, modified_ns)
+    ratings = Dataset.load_from_df(
+        df[["reviewerID", "asin", "overall"]], Reader(rating_scale=(1, 5))
+    )
     algo = SVD(n_factors=50, random_state=42)
-    algo.fit(trainset)
-    
-    # Обучение TF-IDF
-    item_texts = df_clean.groupby('asin')['reviewText'].apply(lambda x: ' '.join(x.astype(str))).reset_index()
-    tfidf = TfidfVectorizer(max_features=5000, stop_words='english')
-    tfidf_matrix = tfidf.fit_transform(item_texts['reviewText'])
-    cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
-    item_id_to_index = {item_id: idx for idx, item_id in enumerate(item_texts['asin'])}
-    
-    return algo, item_texts, cosine_sim, item_id_to_index
+    algo.fit(ratings.build_full_trainset())
 
-# --- 2. ФУНКЦИИ РЕКОМЕНДАЦИЙ ---
-def get_svd_recs(user_id, algo, all_items, n=50):
-    predictions = []
-    for item in all_items:
-        pred = algo.predict(user_id, item)
-        predictions.append((item, pred.est))
-    predictions.sort(key=lambda x: x[1], reverse=True)
-    return [x[0] for x in predictions[:n]]
+    reviews = df["summary"].str.cat(df["reviewText"], sep=" ")
+    item_texts = reviews.groupby(df["asin"]).agg(" ".join)
+    tfidf = TfidfVectorizer(max_features=5000, stop_words="english")
+    if not any(map(tfidf.build_analyzer(), item_texts)):
+        raise ValueError("Для TF-IDF в отзывах нужны тексты с распознаваемыми словами.")
+    return algo, item_texts.index.tolist(), tfidf.fit_transform(item_texts)
 
-def get_content_recs(user_history, item_id_to_index, cosine_sim, all_items, n=50):
-    user_indices = [item_id_to_index[item] for item in user_history if item in item_id_to_index]
-    if not user_indices:
-        return []
-    sim_scores = np.zeros(len(item_id_to_index))
-    for idx in user_indices:
-        sim_scores += cosine_sim[idx]
-    sim_scores_indices = np.argsort(sim_scores)[::-1]
-    
-    recommended = []
-    for i in sim_scores_indices:
-        item_id = list(item_id_to_index.keys())[i]
-        if item_id not in user_history:
-            recommended.append(item_id)
-        if len(recommended) == n:
-            break
-    return recommended
 
-# --- 3. ИНТЕРФЕЙС ---
-st.title("🛍️ Рекомендательная система товаров")
-st.write("Курсовая работа: Ансамбль моделей (SVD + TF-IDF)")
+def recommendations(user_id, history, candidates, model, items, matrix):
+    n = 50
+    svd_rank = sorted(
+        candidates, key=lambda item: model.predict(user_id, item).est, reverse=True
+    )[:n]
+    history_rows = [index for index, item in enumerate(items) if item in history]
+    # TF-IDF уже нормализован. Сумма скалярных произведений даёт сумму
+    # косинусных сходств без хранения квадратной матрицы товаров.
+    profile = np.asarray(matrix[history_rows].sum(axis=0)).ravel()
+    similarities = matrix @ profile
+    text_rank = [items[index] for index in np.argsort(similarities)[::-1] if items[index] not in history][:n]
 
-with st.spinner("Загружаем данные и обучаем модели (займет ~1 минуту)..."):
-    df_clean = load_data()
-    algo, item_texts, cosine_sim, item_id_to_index = train_models(df_clean)
-    all_unique_items = df_clean['asin'].unique().tolist()
-    all_users = df_clean['reviewerID'].unique().tolist()
+    scores = {}
+    for ranking in (svd_rank, text_rank):
+        for index, item in enumerate(ranking):
+            scores[item] = scores.get(item, 0) + 0.5 * (n - index)
+    return sorted(scores, key=scores.__getitem__, reverse=True)[:10]
 
-st.success("Модели готовы!")
 
-# Выбор пользователя
-user_id = st.selectbox("Выберите ID пользователя:", all_users[:100])
+def main():
+    st.title("🛍️ Рекомендательная система товаров")
+    st.write("Ансамбль моделей SVD и TF-IDF")
+    path = data_path()
+    try:
+        with st.spinner("Загружаем отзывы и обучаем модели…"):
+            modified_ns = path.stat().st_mtime_ns
+            df = load_data(path, modified_ns)
+            model, items, matrix = train_models(path, modified_ns)
+    except FileNotFoundError:
+        st.error(f"Файл отзывов не найден: {path}. Поместите выборку в папку data или задайте RECOMMENDER_DATA.")
+        return
+    except (OSError, ValueError) as error:
+        st.error(f"Не удалось загрузить отзывы или обучить модели: {error}")
+        return
 
-if st.button("Показать рекомендации"):
-    with st.spinner("Считаем..."):
-        user_history = df_clean[df_clean['reviewerID'] == user_id]['asin'].tolist()
-        
-        svd_recs = get_svd_recs(user_id, algo, all_unique_items, n=50)
-        tfidf_recs = get_content_recs(user_history, item_id_to_index, cosine_sim, all_unique_items, n=50)
-        
-        alpha = 0.5
-        scores = {}
-        for i, item in enumerate(svd_recs):
-            scores[item] = scores.get(item, 0) + alpha * (50 - i)
-        for i, item in enumerate(tfidf_recs):
-            scores[item] = scores.get(item, 0) + (1 - alpha) * (50 - i)
-            
-        final_recs = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)[:10]
-        
-        st.write(f"### Топ-10 рекомендаций для пользователя {user_id}:")
-        
-        # Выводим в виде красивого списка
-        for i, item in enumerate(final_recs, 1):
-            # Получаем название/описание товара, если есть
-            item_info = df_clean[df_clean['asin'] == item]
-            if not item_info.empty:
-                title = item_info['summary'].iloc[0]
-                rating = item_info['overall'].mean()
-                st.write(f"**{i}. Товар {item}** (Средний рейтинг: {rating:.1f}⭐)")
-                if title and title != "nan":
-                    st.write(f"   *{title[:100]}...*")
-            else:
-                st.write(f"**{i}. Товар {item}**")
+    all_users = df["reviewerID"].unique()
+    st.success("Модели готовы!")
+    user_id = st.selectbox("Выберите ID пользователя:", all_users[:100])
+    if st.button("Показать рекомендации"):
+        history = set(df.loc[df["reviewerID"] == user_id, "asin"])
+        candidates = [item for item in df["asin"].unique() if item not in history]
+        ranked_items = recommendations(user_id, history, candidates, model, items, matrix)
+        if not ranked_items:
+            st.info("Для этого пользователя нет новых товаров.")
+            return
+        st.subheader("Рекомендации")
+        for index, item in enumerate(ranked_items, 1):
+            item_info = df[df["asin"] == item]
+            rating = item_info["overall"].mean()
+            st.write(f"**{index}. Товар {item}** (Средний рейтинг: {rating:.1f} ⭐)")
+            title = item_info["summary"].iloc[0]
+            if title:
+                st.caption(f"Отзыв: {title[:100]}")
+
+
+if __name__ == "__main__":
+    main()

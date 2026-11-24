@@ -1,5 +1,8 @@
 *.json
 *.gz
 *.csv
+*.jsonl
 .ipynb_checkpoints/
 __pycache__/
+.venv/
+data/
